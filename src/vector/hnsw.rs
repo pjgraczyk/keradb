@@ -9,7 +9,7 @@
 //! - Lazy embedding mode for storage savings
 
 use super::distance::calculate_distance;
-use super::types::{Distance, Embedding, VectorDocument, VectorId, VectorConfig};
+use super::types::{Embedding, VectorDocument, VectorId, VectorConfig};
 use crate::error::{KeraDBError, Result};
 
 use parking_lot::RwLock;

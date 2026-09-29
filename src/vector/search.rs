@@ -4,7 +4,7 @@
 
 use super::hnsw::HnswIndex;
 use super::types::{
-    Distance, Embedding, MetadataFilter, VectorConfig, VectorDocument, 
+    Embedding, MetadataFilter, VectorConfig, VectorDocument, 
     VectorId, VectorSearchResult,
 };
 use super::embedding::EmbeddingProvider;
@@ -255,7 +255,7 @@ impl VectorSearcher {
     }
 
     /// Get a collection by name
-    pub fn get_collection(&self, name: &str) -> Option<&VectorCollection> {
+    pub fn get_collection(&self, _name: &str) -> Option<&VectorCollection> {
         // Note: This is tricky with RwLock, might need RefCell pattern
         // For now, we provide methods that operate on collections directly
         None // Placeholder

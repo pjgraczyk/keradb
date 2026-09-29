@@ -1,26 +1,26 @@
-pub mod error;
-pub mod types;
-pub mod storage;
-pub mod execution;
 pub mod cli;
+pub mod error;
+pub mod execution;
 pub mod ffi;
+pub mod storage;
+pub mod types;
 pub mod vector;
 
 use error::Result;
 use execution::Executor;
-use storage::Pager;
-use types::{Config, DocumentId};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use storage::Pager;
+use types::{Config, DocumentId};
 
 // Vector database imports (internal use)
-use vector::embedding::{EmbeddingProvider, EmbeddingConfig, create_provider};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::fs;
 use std::io::{Read, Write};
-use serde::{Serialize, Deserialize};
+use std::sync::Arc;
+use vector::embedding::{create_provider, EmbeddingConfig, EmbeddingProvider};
 
 /// Serialized vector data format for persistence
 #[derive(Serialize, Deserialize)]
@@ -38,6 +38,8 @@ pub struct Database {
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Path to the database file (for vector persistence)
     db_path: PathBuf,
+    /// Whether this database uses a temporary, unlinked backing file
+    in_memory: bool,
 }
 
 impl Database {
@@ -51,7 +53,9 @@ impl Database {
     }
 
     /// Load vector collections from disk
-    fn load_vector_collections(db_path: &Path) -> HashMap<String, vector::search::VectorCollection> {
+    fn load_vector_collections(
+        db_path: &Path,
+    ) -> HashMap<String, vector::search::VectorCollection> {
         let vector_path = Self::vector_data_path(db_path);
         if !vector_path.exists() {
             return HashMap::new();
@@ -64,7 +68,7 @@ impl Database {
                     eprintln!("Failed to read vector data file: {}", e);
                     return HashMap::new();
                 }
-                
+
                 // Deserialize the collections
                 match bincode::deserialize::<SerializedVectorData>(&data) {
                     Ok(serialized) => {
@@ -96,48 +100,53 @@ impl Database {
 
     /// Save vector collections to disk
     fn save_vector_collections(&self) -> Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
+
         let vector_path = Self::vector_data_path(&self.db_path);
         let collections = self.vector_collections.read();
-        
+
         if collections.is_empty() {
             // Remove vector file if no collections
             let _ = fs::remove_file(&vector_path);
             return Ok(());
         }
-        
+
         let mut coll_bytes = Vec::new();
         for coll in collections.values() {
             match coll.to_bytes() {
                 Ok(bytes) => coll_bytes.push(bytes),
                 Err(e) => {
-                    return Err(error::KeraDBError::StorageError(
-                        format!("Failed to serialize vector collection: {}", e)
-                    ));
+                    return Err(error::KeraDBError::StorageError(format!(
+                        "Failed to serialize vector collection: {}",
+                        e
+                    )));
                 }
             }
         }
-        
+
         let serialized = SerializedVectorData {
             version: 1,
             collections: coll_bytes,
         };
-        
+
         let data = bincode::serialize(&serialized).map_err(|e| {
             error::KeraDBError::StorageError(format!("Failed to serialize vector data: {}", e))
         })?;
-        
+
         let mut file = fs::File::create(&vector_path).map_err(|e| {
             error::KeraDBError::StorageError(format!("Failed to create vector file: {}", e))
         })?;
-        
+
         file.write_all(&data).map_err(|e| {
             error::KeraDBError::StorageError(format!("Failed to write vector data: {}", e))
         })?;
-        
+
         file.sync_all().map_err(|e| {
             error::KeraDBError::StorageError(format!("Failed to sync vector file: {}", e))
         })?;
-        
+
         Ok(())
     }
 
@@ -152,12 +161,30 @@ impl Database {
         let path = path.as_ref();
         let pager = Pager::create(path, config.page_size)?;
         let executor = Executor::new(pager, config.cache_size);
-        
-        Ok(Self { 
+
+        Ok(Self {
             executor,
             vector_collections: RwLock::new(HashMap::new()),
             embedding_provider: None,
             db_path: path.to_path_buf(),
+            in_memory: false,
+        })
+    }
+
+    /// Open a database that exists only for the lifetime of this instance.
+    pub fn memory() -> Result<Self> {
+        let config = Config::default();
+        let path = std::env::temp_dir().join(format!("keradb-memory-{}.ndb", uuid::Uuid::new_v4()));
+        let pager = Pager::create(&path, config.page_size)?;
+        fs::remove_file(&path)?;
+        let executor = Executor::new(pager, config.cache_size);
+
+        Ok(Self {
+            executor,
+            vector_collections: RwLock::new(HashMap::new()),
+            embedding_provider: None,
+            db_path: path,
+            in_memory: true,
         })
     }
 
@@ -172,20 +199,21 @@ impl Database {
         let path = path.as_ref();
         let pager = Pager::open(path)?;
         let executor = Executor::new(pager, config.cache_size);
-        
+
         // Load vector collections from disk
         let vector_collections = Self::load_vector_collections(path);
-        
-        Ok(Self { 
+
+        Ok(Self {
             executor,
             vector_collections: RwLock::new(vector_collections),
             embedding_provider: None,
             db_path: path.to_path_buf(),
+            in_memory: false,
         })
     }
 
     /// Insert a document into a collection
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let doc = json!({"name": "Alice", "age": 30});
@@ -196,7 +224,7 @@ impl Database {
     }
 
     /// Find a document by ID
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let doc = db.find_by_id("users", "abc123")?;
@@ -206,7 +234,7 @@ impl Database {
     }
 
     /// Update a document
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// db.update("users", "abc123", json!({"age": 31}))?;
@@ -216,7 +244,7 @@ impl Database {
     }
 
     /// Delete a document
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// db.delete("users", "abc123")?;
@@ -226,18 +254,23 @@ impl Database {
     }
 
     /// Find all documents in a collection
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let docs = db.find_all("users", None, None)?;
     /// let page = db.find_all("users", Some(10), Some(20))?; // limit 10, skip 20
     /// ```
-    pub fn find_all(&self, collection: &str, limit: Option<usize>, skip: Option<usize>) -> Result<Vec<types::Document>> {
+    pub fn find_all(
+        &self,
+        collection: &str,
+        limit: Option<usize>,
+        skip: Option<usize>,
+    ) -> Result<Vec<types::Document>> {
         self.executor.find_all(collection, limit, skip)
     }
 
     /// Count documents in a collection
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let count = db.count("users");
@@ -247,7 +280,7 @@ impl Database {
     }
 
     /// List all collections with document counts
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let collections = db.list_collections();
@@ -263,10 +296,10 @@ impl Database {
     pub fn sync(&self) -> Result<()> {
         // Sync document data
         self.executor.sync()?;
-        
+
         // Sync vector collections
         self.save_vector_collections()?;
-        
+
         Ok(())
     }
 
@@ -275,21 +308,21 @@ impl Database {
     // ============================================================
 
     /// Create a vector collection for similarity search
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// use keradb::vector::VectorConfig;
-    /// 
+    ///
     /// let db = Database::create("mydata.ndb")?;
     /// db.create_vector_collection("embeddings", VectorConfig::new(384))?;
     /// ```
     pub fn create_vector_collection(&self, name: &str, config: vector::VectorConfig) -> Result<()> {
         let mut collections = self.vector_collections.write();
-        
+
         if collections.contains_key(name) {
             return Err(error::KeraDBError::CollectionExists(name.to_string()));
         }
-        
+
         let collection = if let Some(ref provider) = self.embedding_provider {
             vector::search::VectorCollection::with_embedding_provider(
                 name.to_string(),
@@ -299,18 +332,18 @@ impl Database {
         } else {
             vector::search::VectorCollection::new(name.to_string(), config)
         };
-        
+
         collections.insert(name.to_string(), collection);
         drop(collections); // Release the lock before saving
-        
+
         // Auto-save vector collections
         self.save_vector_collections()?;
-        
+
         Ok(())
     }
 
     /// Insert a vector into a collection
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let vector = vec![0.1, 0.2, 0.3, ...]; // 384 dimensions
@@ -324,23 +357,23 @@ impl Database {
     ) -> Result<VectorId> {
         let id = {
             let collections = self.vector_collections.read();
-            let coll = collections.get(collection).ok_or_else(|| {
-                error::KeraDBError::CollectionNotFound(collection.to_string())
-            })?;
+            let coll = collections
+                .get(collection)
+                .ok_or_else(|| error::KeraDBError::CollectionNotFound(collection.to_string()))?;
             coll.insert(vector, metadata)?
         };
-        
+
         // Auto-save vector collections after insert
         self.save_vector_collections()?;
-        
+
         Ok(id)
     }
 
     /// Insert text into a vector collection (requires embedding provider)
-    /// 
+    ///
     /// # Example
     /// ```ignore
-    /// db.insert_text("documents", "Machine learning is fascinating", 
+    /// db.insert_text("documents", "Machine learning is fascinating",
     ///     Some(json!({"category": "tech"})))?;
     /// ```
     pub fn insert_text(
@@ -351,20 +384,20 @@ impl Database {
     ) -> Result<VectorId> {
         let id = {
             let collections = self.vector_collections.read();
-            let coll = collections.get(collection).ok_or_else(|| {
-                error::KeraDBError::CollectionNotFound(collection.to_string())
-            })?;
+            let coll = collections
+                .get(collection)
+                .ok_or_else(|| error::KeraDBError::CollectionNotFound(collection.to_string()))?;
             coll.insert_text(text, metadata)?
         };
-        
+
         // Auto-save vector collections after insert
         self.save_vector_collections()?;
-        
+
         Ok(id)
     }
 
     /// Search for similar vectors
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let query = vec![0.1, 0.2, 0.3, ...];
@@ -380,14 +413,14 @@ impl Database {
         k: usize,
     ) -> Result<Vec<VectorSearchResult>> {
         let collections = self.vector_collections.read();
-        let coll = collections.get(collection).ok_or_else(|| {
-            error::KeraDBError::CollectionNotFound(collection.to_string())
-        })?;
+        let coll = collections
+            .get(collection)
+            .ok_or_else(|| error::KeraDBError::CollectionNotFound(collection.to_string()))?;
         coll.search(query, k)
     }
 
     /// Search for similar vectors by text query
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let results = db.vector_search_text("documents", "artificial intelligence", 10)?;
@@ -399,14 +432,14 @@ impl Database {
         k: usize,
     ) -> Result<Vec<VectorSearchResult>> {
         let collections = self.vector_collections.read();
-        let coll = collections.get(collection).ok_or_else(|| {
-            error::KeraDBError::CollectionNotFound(collection.to_string())
-        })?;
+        let coll = collections
+            .get(collection)
+            .ok_or_else(|| error::KeraDBError::CollectionNotFound(collection.to_string()))?;
         coll.search_text(query, k)
     }
 
     /// Search with metadata filtering
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let filter = MetadataFilter::new().eq("category", json!("tech"));
@@ -420,18 +453,22 @@ impl Database {
         filter: &MetadataFilter,
     ) -> Result<Vec<VectorSearchResult>> {
         let collections = self.vector_collections.read();
-        let coll = collections.get(collection).ok_or_else(|| {
-            error::KeraDBError::CollectionNotFound(collection.to_string())
-        })?;
+        let coll = collections
+            .get(collection)
+            .ok_or_else(|| error::KeraDBError::CollectionNotFound(collection.to_string()))?;
         coll.search_filtered(query, k, filter)
     }
 
     /// Get a vector document by ID
-    pub fn get_vector(&self, collection: &str, id: VectorId) -> Result<Option<vector::VectorDocument>> {
+    pub fn get_vector(
+        &self,
+        collection: &str,
+        id: VectorId,
+    ) -> Result<Option<vector::VectorDocument>> {
         let collections = self.vector_collections.read();
-        let coll = collections.get(collection).ok_or_else(|| {
-            error::KeraDBError::CollectionNotFound(collection.to_string())
-        })?;
+        let coll = collections
+            .get(collection)
+            .ok_or_else(|| error::KeraDBError::CollectionNotFound(collection.to_string()))?;
         Ok(coll.get(id))
     }
 
@@ -439,15 +476,15 @@ impl Database {
     pub fn delete_vector(&self, collection: &str, id: VectorId) -> Result<bool> {
         let result = {
             let collections = self.vector_collections.read();
-            let coll = collections.get(collection).ok_or_else(|| {
-                error::KeraDBError::CollectionNotFound(collection.to_string())
-            })?;
+            let coll = collections
+                .get(collection)
+                .ok_or_else(|| error::KeraDBError::CollectionNotFound(collection.to_string()))?;
             coll.delete(id)?
         };
-        
+
         // Auto-save vector collections after delete
         self.save_vector_collections()?;
-        
+
         Ok(result)
     }
 
@@ -463,10 +500,10 @@ impl Database {
     /// Drop a vector collection
     pub fn drop_vector_collection(&self, name: &str) -> Result<bool> {
         let removed = self.vector_collections.write().remove(name).is_some();
-        
+
         // Auto-save vector collections after drop
         self.save_vector_collections()?;
-        
+
         Ok(removed)
     }
 
@@ -479,10 +516,10 @@ impl Database {
     /// Get vector collection statistics
     pub fn vector_stats(&self, collection: &str) -> Result<vector::VectorCollectionStats> {
         let collections = self.vector_collections.read();
-        let coll = collections.get(collection).ok_or_else(|| {
-            error::KeraDBError::CollectionNotFound(collection.to_string())
-        })?;
-        
+        let coll = collections
+            .get(collection)
+            .ok_or_else(|| error::KeraDBError::CollectionNotFound(collection.to_string()))?;
+
         Ok(vector::VectorCollectionStats {
             name: coll.name.clone(),
             vector_count: coll.len(),
@@ -504,12 +541,11 @@ pub use error::KeraDBError;
 pub use types::Document;
 
 // Re-export vector types for public API
-pub use vector::{
-    VectorConfig, VectorDocument, VectorSearchResult, 
-    Embedding, VectorId, Distance, MetadataFilter, VectorCollectionStats,
-    CompressionConfig, CompressionMode, CompressionStats,
-};
 pub use vector::search::VectorCollection;
+pub use vector::{
+    CompressionConfig, CompressionMode, CompressionStats, Distance, Embedding, MetadataFilter,
+    VectorCollectionStats, VectorConfig, VectorDocument, VectorId, VectorSearchResult,
+};
 
 #[cfg(test)]
 mod tests {
@@ -541,15 +577,20 @@ mod tests {
         let db = Database::create(&path).unwrap();
 
         // Insert
-        let id1 = db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
-        let id2 = db.insert("users", json!({"name": "Bob", "age": 25})).unwrap();
+        let id1 = db
+            .insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
+        let id2 = db
+            .insert("users", json!({"name": "Bob", "age": 25}))
+            .unwrap();
 
         // Find
         let alice = db.find_by_id("users", &id1).unwrap();
         assert_eq!(alice.data.get("name").unwrap(), "Alice");
 
         // Update
-        db.update("users", &id1, json!({"name": "Alice", "age": 31})).unwrap();
+        db.update("users", &id1, json!({"name": "Alice", "age": 31}))
+            .unwrap();
         let updated = db.find_by_id("users", &id1).unwrap();
         assert_eq!(updated.data.get("age").unwrap(), 31);
 

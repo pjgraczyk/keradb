@@ -1,25 +1,93 @@
+use crate::vector::{Distance, VectorConfig};
 use crate::Database;
-use crate::vector::{VectorConfig, Distance};
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::FileHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, Helper};
 use std::path::Path;
+
+struct CommandCompleter;
+
+impl Completer for CommandCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let input = &line[..pos];
+        if input.contains(char::is_whitespace) {
+            return Ok((pos, Vec::new()));
+        }
+
+        let commands = [
+            "help",
+            "exit",
+            "quit",
+            "collections",
+            "insert",
+            "find",
+            "update",
+            "delete",
+            "count",
+            "sync",
+            "vcreate",
+            "vinsert",
+            "vsearch",
+            "vcollections",
+            "vstats",
+            "vdrop",
+        ];
+        let candidates = commands
+            .iter()
+            .filter(|command| command.starts_with(input))
+            .map(|command| Pair {
+                display: (*command).into(),
+                replacement: (*command).into(),
+            })
+            .collect();
+
+        Ok((0, candidates))
+    }
+}
+
+impl Hinter for CommandCompleter {
+    type Hint = String;
+}
+
+impl Highlighter for CommandCompleter {}
+impl Validator for CommandCompleter {}
+impl Helper for CommandCompleter {}
 
 pub struct Repl {
     db: Database,
-    editor: DefaultEditor,
+    editor: Editor<CommandCompleter, FileHistory>,
 }
 
 impl Repl {
-    pub fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let db = if path.as_ref().exists() {
-            Database::open(path)?
+    pub fn new<P: AsRef<Path>>(path: Option<P>) -> anyhow::Result<Self> {
+        if let Some(path) = path {
+            let db = if path.as_ref().exists() {
+                Database::open(path)?
+            } else {
+                Database::create(path)?
+            };
+
+            let mut editor = Editor::new()?;
+            editor.set_helper(Some(CommandCompleter));
+
+            Ok(Self { db, editor })
         } else {
-            Database::create(path)?
-        };
-
-        let editor = DefaultEditor::new()?;
-
-        Ok(Self { db, editor })
+            let mut editor: Editor<CommandCompleter, _> = Editor::new()?;
+            editor.set_helper(Some(CommandCompleter));
+            let db = Database::memory()?;
+            Ok(Self { db, editor })
+        }
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
@@ -61,7 +129,7 @@ impl Repl {
 
     fn execute_command(&self, line: &str) -> anyhow::Result<()> {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        
+
         if parts.is_empty() {
             return Ok(());
         }
@@ -87,7 +155,10 @@ impl Repl {
             "vstats" => self.vector_stats(&parts[1..])?,
             "vdrop" => self.vector_drop(&parts[1..])?,
             _ => {
-                println!("Unknown command: {}. Type 'help' for available commands.", parts[0]);
+                println!(
+                    "Unknown command: {}. Type 'help' for available commands.",
+                    parts[0]
+                );
             }
         }
 
@@ -128,7 +199,7 @@ impl Repl {
 
     fn list_collections(&self) -> anyhow::Result<()> {
         let collections = self.db.list_collections();
-        
+
         if collections.is_empty() {
             println!("No collections found");
             return Ok(());
@@ -138,7 +209,7 @@ impl Repl {
         for (name, count) in collections {
             println!("  {} ({} documents)", name, count);
         }
-        
+
         Ok(())
     }
 
@@ -169,7 +240,7 @@ impl Repl {
         if args.len() == 1 {
             // Find all
             let docs = self.db.find_all(collection, Some(10), None)?;
-            
+
             if docs.is_empty() {
                 println!("No documents found");
                 return Ok(());
@@ -252,7 +323,8 @@ impl Repl {
         }
 
         let name = args[0];
-        let dimensions: usize = args[1].parse()
+        let dimensions: usize = args[1]
+            .parse()
             .map_err(|_| anyhow::anyhow!("Invalid dimensions: {}", args[1]))?;
 
         let distance = if args.len() > 2 {
@@ -272,9 +344,13 @@ impl Repl {
 
         let config = VectorConfig::new(dimensions).with_distance(distance);
         self.db.create_vector_collection(name, config)?;
-        
-        println!("Created vector collection '{}' with {} dimensions ({} distance)", 
-                 name, dimensions, distance.name());
+
+        println!(
+            "Created vector collection '{}' with {} dimensions ({} distance)",
+            name,
+            dimensions,
+            distance.name()
+        );
 
         Ok(())
     }

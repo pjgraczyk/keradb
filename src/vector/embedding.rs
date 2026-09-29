@@ -6,7 +6,7 @@
 //! - Custom embedding functions
 
 use super::types::Embedding;
-use crate::error::{KeraDBError, Result};
+use crate::error::Result;
 
 use std::sync::Arc;
 
